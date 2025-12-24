@@ -1,86 +1,229 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { connectDB } from "@/lib/mongodb";
+import Order from "@/models/Order";
+import Cart from "@/models/Cart";
 import Product from "@/models/Product";
-import User from "@/models/User";
-import OrderItem from "@/models/OrderItem";
 
-export async function POST(req: Request) {
+/**
+ * POST /api/order/create
+ * Create a new order from cart items
+ * Body: {
+ *   shippingAddress: {
+ *     name, phone, addressLine1, addressLine2, city, state, pincode
+ *   },
+ *   notes?: string
+ * }
+ */
+export async function POST(req: NextRequest) {
   try {
-    // 1. Check Authentication
     const session = await getServerSession();
-    if (!session?.user?.email) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    if (!session || !session.user?.email) {
+      return NextResponse.json(
+        { success: false, message: "Unauthorized" },
+        { status: 401 }
+      );
     }
 
-    // 2. Get data from Frontend
-    const { productId, size, quantity } = await req.json();
+    const body = await req.json();
+    const { shippingAddress, notes = "" } = body;
 
-    if (!productId || !quantity) {
-      return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
+    // Validate shipping address
+    if (
+      !shippingAddress ||
+      !shippingAddress.name ||
+      !shippingAddress.phone ||
+      !shippingAddress.addressLine1 ||
+      !shippingAddress.city ||
+      !shippingAddress.state ||
+      !shippingAddress.pincode
+    ) {
+      return NextResponse.json(
+        { success: false, message: "Complete shipping address is required" },
+        { status: 400 }
+      );
     }
 
     await connectDB();
-
-    // 3. Find the User
+    
+    // Import User model to find user ID
+    const User = (await import("@/models/User")).default;
     const user = await User.findOne({ email: session.user.email });
     if (!user) {
-      return NextResponse.json({ error: "User not found" }, { status: 404 });
+      return NextResponse.json(
+        { success: false, message: "User not found" },
+        { status: 404 }
+      );
     }
 
-    // 4. Find the Product (to get real Price and check Stock)
-    const product = await Product.findOne({ product_id: productId }); // Assuming passing product_id, or use _id
-    // If frontend passes MongoDB _id, use: await Product.findById(productId);
+    // Get user's cart using user_email
+    const cart = await Cart.findOne({ user_email: session.user.email }).populate(
+      "items.product"
+    );
+
+    if (!cart || cart.items.length === 0) {
+      return NextResponse.json(
+        { success: false, message: "Cart is empty" },
+        { status: 400 }
+      );
+    }
+
+    // Validate stock availability for all items
+    for (const item of cart.items) {
+      const product = await Product.findById(item.product._id);
+      
+      if (!product) {
+        return NextResponse.json(
+          { success: false, message: `Product ${item.product.name} not found` },
+          { status: 404 }
+        );
+      }
+
+      // Check stock
+      if (product.size_boolean && item.size) {
+        const stockItem = product.stock.find((s: any) => s.size === item.size);
+        if (!stockItem || stockItem.quantity < item.quantity) {
+          return NextResponse.json(
+            {
+              success: false,
+              message: `Insufficient stock for ${product.name} (Size: ${item.size})`,
+            },
+            { status: 400 }
+          );
+        }
+      } else if (!product.size_boolean) {
+        if (product.stock_quantity < item.quantity) {
+          return NextResponse.json(
+            {
+              success: false,
+              message: `Insufficient stock for ${product.name}`,
+            },
+            { status: 400 }
+          );
+        }
+      }
+    }
+
+    // Prepare order items with snapshot of product data
+    const orderItems = cart.items.map((item: any) => ({
+      product: item.product._id,
+      productName: item.product.name,
+      productImage: item.product.img,
+      quantity: item.quantity,
+      size: item.size,
+      price: item.price,
+      subtotal: item.price * item.quantity,
+    }));
+
+    // Calculate totals
+    const subtotal = orderItems.reduce(
+      (sum: number, item: any) => sum + item.subtotal,
+      0
+    );
     
-    if (!product) {
-      return NextResponse.json({ error: "Product not found" }, { status: 404 });
-    }
+    // You can add logic for shipping and tax calculation
+    const shippingCost = subtotal >= 500 ? 0 : 50; // Free shipping above ₹500
+    const tax = Math.round(subtotal * 0.18); // 18% GST
+    const totalAmount = subtotal + shippingCost + tax;
 
-    // 5. Validation Logic
-    // If product requires size, ensure size is selected
-    if (product.size_boolean && !size) {
-      return NextResponse.json({ error: "Please select a size" }, { status: 400 });
-    }
-
-    // Check stock 
-    let availableStock = 0;
-    if (product.size_boolean) {
-        const sizeItem = product.stock.find((s: any) => s.size === size);
-        availableStock = sizeItem ? sizeItem.quantity : 0;
-    } else {
-        availableStock = product.stock_quantity;
-    }
-
-    if (quantity > availableStock) {
-        return NextResponse.json({ error: `Only ${availableStock} items left in stock` }, { status: 400 });
-    }
-
-    // 6. Calculate Cost (Your logic: Price * Quantity)
-    const totalCost = product.price * Number(quantity);
-
-    // 7. Create the Order Item 
-    const newOrderItem = await OrderItem.create({
+    // Create order
+    const order = new Order({
       user: user._id,
-      product: product._id, // Saving the MongoDB Object ID
-      size: size || null,
-      quantity: Number(quantity),
-      cost: totalCost,
-      status: "cart"
+      items: orderItems,
+      subtotal,
+      shippingCost,
+      tax,
+      totalAmount,
+      shippingAddress,
+      notes,
+      status: "pending",
+      paymentStatus: "pending",
     });
 
-    
-    // We add this new OrderItem ID to the User's cart array in User.ts
-    await User.findByIdAndUpdate(user._id, {
-        $push: { cart: newOrderItem._id } 
+    await order.save();
+
+    return NextResponse.json({
+      success: true,
+      message: "Order created successfully",
+      data: {
+        orderId: order._id,
+        orderNumber: order.orderId,
+        totalAmount: order.totalAmount,
+      },
     });
-
-    return NextResponse.json({ 
-        message: "Item added to order list", 
-        orderItem: newOrderItem 
-    }, { status: 201 });
-
   } catch (error) {
-    console.error(error);
-    return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
+    console.error("Error creating order:", error);
+    return NextResponse.json(
+      { success: false, message: "Failed to create order" },
+      { status: 500 }
+    );
+  }
+}
+
+/**
+ * GET /api/order/create
+ * Get order details by order ID
+ * Query: ?orderId=xxx
+ */
+export async function GET(req: NextRequest) {
+  try {
+    const session = await getServerSession();
+    if (!session || !session.user?.email) {
+      return NextResponse.json(
+        { success: false, message: "Unauthorized" },
+        { status: 401 }
+      );
+    }
+
+    const { searchParams } = new URL(req.url);
+    const orderId = searchParams.get("orderId");
+
+    if (!orderId) {
+      return NextResponse.json(
+        { success: false, message: "Order ID is required" },
+        { status: 400 }
+      );
+    }
+
+    await connectDB();
+    
+    // Import User model to find user ID
+    const User = (await import("@/models/User")).default;
+    const user = await User.findOne({ email: session.user.email });
+    if (!user) {
+      return NextResponse.json(
+        { success: false, message: "User not found" },
+        { status: 404 }
+      );
+    }
+
+    // Find order by orderId (string) not _id (ObjectId)
+    const order = await Order.findOne({ orderId }).populate("items.product");
+
+    if (!order) {
+      return NextResponse.json(
+        { success: false, message: "Order not found" },
+        { status: 404 }
+      );
+    }
+
+    // Verify order belongs to user
+    if (order.user.toString() !== user._id.toString()) {
+      return NextResponse.json(
+        { success: false, message: "Unauthorized access to order" },
+        { status: 403 }
+      );
+    }
+
+    return NextResponse.json({
+      success: true,
+      data: order,
+    });
+  } catch (error) {
+    console.error("Error fetching order:", error);
+    return NextResponse.json(
+      { success: false, message: "Failed to fetch order" },
+      { status: 500 }
+    );
   }
 }
